@@ -1,0 +1,167 @@
+name: P06-T2 Build Diagnostic
+
+# Diagnostic only (P06-T2, CI half). Manual dispatch ONLY - no push/PR triggers.
+# Attempts to build AutoDMG at the Academy fork point on a modern runner and
+# captures the exact failure (predicted: AD-F-04, Python 2 framework).
+# No app code is changed by this workflow. No signing, no release, no publish.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-diagnostic:
+    name: Build diagnostic (oldest Xcode on macos-15)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (diagnostic branch = fork point + this workflow)
+        uses: actions/checkout@v4
+
+      - name: Select oldest available Xcode and capture environment
+        shell: bash
+        run: |
+          mkdir -p diagnostic
+          {
+            echo "=== P06-T2 diagnostic environment ==="
+            echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "git HEAD: $(git rev-parse HEAD)"
+            echo "--- sw_vers ---"; sw_vers || true
+            echo "--- uname ---"; uname -a || true
+            echo "--- runner arch ---"; arch || true; sysctl -n machdep.cpu.brand_string || true
+            echo "--- all Xcodes present ---"; ls -d /Applications/Xcode*.app 2>/dev/null || true
+          } | tee diagnostic/env.txt
+          OLDEST="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | head -n 1)"
+          if [ -z "$OLDEST" ] && [ -d /Applications/Xcode.app ]; then OLDEST="/Applications/Xcode.app"; fi
+          echo "oldest Xcode selected: $OLDEST" | tee -a diagnostic/env.txt
+          if [ -n "$OLDEST" ]; then sudo xcode-select -s "$OLDEST/Contents/Developer" || true; fi
+          {
+            echo "--- xcode-select -p ---"; xcode-select -p || true
+            echo "--- xcodebuild -version ---"; xcodebuild -version || true
+            echo "--- xcodebuild -showsdks ---"; xcodebuild -showsdks || true
+            echo "--- clang ---"; clang --version || true
+            echo "--- host Python.framework ---"; ls -ld /System/Library/Frameworks/Python.framework 2>&1 || true
+            echo "--- host /usr/bin/python* ---"; ls -l /usr/bin/python* 2>&1 || true
+            echo "--- which pythons ---"; which -a python python2 python2.7 python3 2>&1 || true
+            python3 --version 2>&1 || true
+            echo "--- SDK Python.framework check (every macOS SDK) ---"
+            for sdk in $(xcodebuild -showsdks 2>/dev/null | awk '/macosx/{print $NF}'); do
+              SDKPATH="$(xcrun --sdk "$sdk" --show-sdk-path 2>/dev/null)"
+              echo "sdk=$sdk path=$SDKPATH"
+              ls -ld "$SDKPATH/System/Library/Frameworks/Python.framework" 2>&1 || true
+              ls "$SDKPATH/System/Library/Frameworks/Python.framework/Headers/Python.h" 2>&1 || true
+              ls -ld "$SDKPATH/System/Library/Frameworks/ExceptionHandling.framework" 2>&1 || true
+            done
+          } 2>&1 | tee -a diagnostic/env.txt
+
+      - name: Show build settings (diagnostic)
+        shell: bash
+        run: |
+          set +e
+          xcodebuild -project AutoDMG.xcodeproj -scheme AutoDMG -configuration Release -showBuildSettings CODE_SIGNING_ALLOWED=NO ARCHS=x86_64 MACOSX_DEPLOYMENT_TARGET=10.13 > diagnostic/build-settings.txt 2>&1
+          echo "showBuildSettings exit: $?" | tee -a diagnostic/build-settings.txt
+          grep -E "MACOSX_DEPLOYMENT_TARGET|PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN|ARCHS|SDKROOT" diagnostic/build-settings.txt || true
+          exit 0
+
+      - name: Attempt build (the diagnostic itself)
+        shell: bash
+        run: |
+          set +e
+          echo "COMMAND: xcodebuild -project AutoDMG.xcodeproj -scheme AutoDMG -configuration Release CODE_SIGNING_ALLOWED=NO ARCHS=x86_64 MACOSX_DEPLOYMENT_TARGET=10.13 build" | tee diagnostic/build-command.txt
+          xcodebuild -project AutoDMG.xcodeproj -scheme AutoDMG -configuration Release CODE_SIGNING_ALLOWED=NO ARCHS=x86_64 MACOSX_DEPLOYMENT_TARGET=10.13 build > diagnostic/build.log 2>&1
+          EC=$?
+          echo "$EC" > diagnostic/build-exit-code.txt
+          echo "xcodebuild exit code: $EC"
+          echo "----- build.log (full, also uploaded as artifact) -----"
+          cat diagnostic/build.log
+          # The job's verdict is carried by the artifacts + summary, not by
+          # failing the step here; the Verdict step below records it and
+          # this step is marked failed at the end if the build failed, so
+          # the run conclusion is truthful.
+          if [ "$EC" -ne 0 ]; then echo "BUILD_FAILED" > diagnostic/build-result.txt; else echo "BUILD_SUCCEEDED" > diagnostic/build-result.txt; fi
+          exit 0
+
+      - name: Verdict - did AD-F-04 (Python 2 framework) fire?
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "=== P06-T2 VERDICT ==="
+            echo "build result: $(cat diagnostic/build-result.txt 2>/dev/null || echo UNKNOWN)"
+            echo "xcodebuild exit code: $(cat diagnostic/build-exit-code.txt 2>/dev/null || echo UNKNOWN)"
+            echo ""
+            echo "--- all error lines ---"
+            grep -n -i "error:" diagnostic/build.log || true
+            echo ""
+            echo "--- Python-related lines ---"
+            grep -n -i "python" diagnostic/build.log || true
+            echo ""
+            echo "--- linker (ld) lines ---"
+            grep -n "^ld:\|ld: " diagnostic/build.log || true
+            echo ""
+            echo "--- framework-not-found lines ---"
+            grep -n -i "framework not found\|no such file\|file not found" diagnostic/build.log || true
+            echo ""
+            echo "--- AD-F-04 classification ---"
+            if grep -q -i "python" diagnostic/build.log && grep -q -i -E "error:|framework not found|file not found|no such file" diagnostic/build.log; then
+              if grep -i "python" diagnostic/build.log | grep -q -i -E "error:|not found|no such file"; then
+                echo "AD-F-04 FIRED: a Python-framework error is present in the build log (see Python-related lines above)."
+              else
+                echo "AD-F-04 UNCLEAR: Python is mentioned but the failing line must be read manually (see log)."
+              fi
+            else
+              echo "AD-F-04 DID NOT FIRE AS THE RECORDED FAILURE: see error lines above for what fired instead."
+            fi
+            echo ""
+            echo "--- BUILD status tail ---"
+            grep -n "BUILD SUCCEEDED\|BUILD FAILED" diagnostic/build.log || true
+            echo ""
+            echo "--- built products (if any) ---"
+            find . -name "*.app" -maxdepth 6 -print 2>/dev/null || true
+            ls -la build/Release/ 2>/dev/null || true
+          } 2>&1 | tee diagnostic/verdict.txt
+          {
+            echo "## P06-T2 AutoDMG build diagnostic"
+            echo ""
+            echo "- Build result: **$(cat diagnostic/build-result.txt 2>/dev/null || echo UNKNOWN)** (xcodebuild exit $(cat diagnostic/build-exit-code.txt 2>/dev/null || echo '?'))"
+            echo "- Full log + env + verdict: see the \`p06-t2-diagnostic\` artifact of this run."
+            echo ""
+            echo '```'
+            cat diagnostic/verdict.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Package built app into artifact only (only if build unexpectedly succeeded)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ "$(cat diagnostic/build-result.txt 2>/dev/null)" = "BUILD_SUCCEEDED" ]; then
+            APP="$(find . -name 'AutoDMG.app' -maxdepth 6 -print -quit 2>/dev/null)"
+            echo "unexpected success; app at: $APP" | tee -a diagnostic/verdict.txt
+            if [ -n "$APP" ]; then ditto -c -k --keepParent "$APP" diagnostic/AutoDMG-app-UNVERIFIED-modern-runner.zip || true; fi
+            echo "NOTE: a modern-runner success is NOT a macOS 10.13 floor proof." | tee -a diagnostic/verdict.txt
+          fi
+          exit 0
+
+      - name: Upload diagnostic artifact (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p06-t2-diagnostic
+          path: diagnostic/
+          if-no-files-found: warn
+
+      - name: Reflect build outcome in job conclusion
+        shell: bash
+        run: |
+          if [ "$(cat diagnostic/build-result.txt 2>/dev/null)" = "BUILD_SUCCEEDED" ]; then
+            echo "Build succeeded on this modern runner (not a 10.13 proof)."
+            exit 0
+          fi
+          echo "Build failed as captured in diagnostic/verdict.txt - failing the job so the run conclusion is truthful."
+          exit 1
